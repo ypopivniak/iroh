@@ -16,7 +16,7 @@
 //! however, read any packets that come off the UDP sockets.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt::Display,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
@@ -87,6 +87,15 @@ pub use self::{
     metrics::Metrics,
 };
 
+/// Filter for network interfaces and addresses.
+#[derive(Debug, Default, Clone)]
+pub struct NetFilter {
+    /// Addresses to explicitly ignore during discovery.
+    pub ignore_addrs: HashSet<IpAddr>,
+    /// If not empty, only these addresses will be considered.
+    pub allow_addrs: HashSet<IpAddr>,
+}
+
 /// How long we consider a QAD-derived endpoint valid for. UDP NAT mappings typically
 /// expire at 30 seconds, so this is a few seconds shy of that.
 const ENDPOINTS_FRESH_ENOUGH_DURATION: Duration = Duration::from_secs(27);
@@ -138,6 +147,9 @@ pub(crate) struct Options {
     pub(crate) path_selection: PathSelection,
 
     pub(crate) metrics: EndpointMetrics,
+
+    /// Optional network filter.
+    pub(crate) net_filter: Option<NetFilter>,
 }
 
 /// Handle for [`MagicSock`].
@@ -207,6 +219,9 @@ pub(crate) struct MagicSock {
     discovery: ConcurrentDiscovery,
     /// Optional user-defined discover data.
     discovery_user_data: RwLock<Option<UserData>>,
+
+    /// Optional network filter.
+    net_filter: Option<NetFilter>,
 
     /// Metrics
     pub(crate) metrics: EndpointMetrics,
@@ -1364,6 +1379,7 @@ impl Handle {
             #[cfg(any(test, feature = "test-utils"))]
             path_selection,
             metrics,
+            net_filter,
         } = opts;
 
         let discovery = ConcurrentDiscovery::default();
@@ -1433,6 +1449,7 @@ impl Handle {
             discovery,
             relay_map: relay_map.clone(),
             discovery_user_data: RwLock::new(discovery_user_data),
+            net_filter,
             direct_addrs: DiscoveredDirectAddrs::default(),
             net_report: Watchable::new((None, UpdateReason::None)),
             #[cfg(not(wasm_browser))]
@@ -2199,6 +2216,16 @@ impl Actor {
             }
 
             for ip in ips {
+                if let Some(ref filter) = self.msock.net_filter {
+                    if !filter.allow_addrs.is_empty() && !filter.allow_addrs.contains(&ip) {
+                        info!("skipping {ip:?} because it's not in allow_addrs");
+                        continue;
+                    }
+                    if filter.ignore_addrs.contains(&ip) {
+                        info!("skipping address {ip} due to netfilter");
+                        continue;
+                    }
+                }
                 let port_if_unspecified = match ip {
                     IpAddr::V4(_) => has_ipv4_unspecified,
                     IpAddr::V6(_) => has_ipv6_unspecified,
@@ -2533,7 +2560,7 @@ mod tests {
     use tracing::{Instrument, error, info, info_span, instrument};
     use tracing_test::traced_test;
 
-    use super::{EndpointIdMappedAddr, Options};
+    use super::{EndpointIdMappedAddr, NetFilter, Options};
     use crate::{
         Endpoint, RelayMap, RelayMode, SecretKey,
         dns::DnsResolver,
@@ -2561,6 +2588,7 @@ mod tests {
             path_selection: PathSelection::default(),
             discovery_user_data: None,
             metrics: Default::default(),
+            net_filter: None,
         }
     }
 
@@ -3092,9 +3120,51 @@ mod tests {
             insecure_skip_relay_cert_verify: false,
             path_selection: PathSelection::default(),
             metrics: Default::default(),
+            net_filter: None,
         };
         let msock = MagicSock::spawn(opts).await?;
         Ok(msock)
+    }
+
+    #[tokio::test]
+    async fn test_net_filter() {
+        let mut rng = rand::rng();
+        let secret_key = SecretKey::generate(&mut rng);
+        let mut server_config = make_default_server_config(&secret_key);
+        server_config.transport_config(Arc::new(quinn::TransportConfig::default()));
+
+        let dns_resolver = DnsResolver::new();
+        let mut net_filter = NetFilter::default();
+        // Ignore all IPv4 loopback (this is just an example, as loopback is only used if no other interfaces are found)
+        let ignored_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        net_filter.ignore_addrs.insert(ignored_ip);
+
+        let opts = Options {
+            addr_v4: None,
+            addr_v6: None,
+            secret_key: secret_key.clone(),
+            relay_map: RelayMap::empty(),
+            discovery_user_data: None,
+            dns_resolver,
+            proxy_url: None,
+            server_config,
+            #[cfg(any(test, feature = "test-utils"))]
+            insecure_skip_relay_cert_verify: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            path_selection: PathSelection::default(),
+            metrics: Default::default(),
+            net_filter: Some(net_filter),
+        };
+        let msock = MagicSock::spawn(opts).await.unwrap();
+
+        // Wait a bit for discovery to run
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut addrs = msock.ip_addrs();
+        let value = n0_watcher::Watcher::get(&mut addrs);
+        for addr in value.iter() {
+            assert_ne!(addr.addr.ip(), ignored_ip, "Ignored IP should not be discovered");
+        }
     }
 
     /// Connects from `ep` returned by [`magicsock_ep`] to the `endpoint_id`.

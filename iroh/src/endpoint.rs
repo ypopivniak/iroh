@@ -12,7 +12,7 @@
 //! [module docs]: crate
 
 use std::{
-    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
 };
 
@@ -115,6 +115,7 @@ pub struct Builder {
     #[cfg(any(test, feature = "test-utils"))]
     path_selection: PathSelection,
     max_tls_tickets: usize,
+    net_filter: Option<magicsock::NetFilter>,
 }
 
 impl Builder {
@@ -156,6 +157,7 @@ impl Builder {
             #[cfg(any(test, feature = "test-utils"))]
             path_selection: PathSelection::default(),
             max_tls_tickets: DEFAULT_MAX_TLS_TICKETS,
+            net_filter: None,
         }
     }
 
@@ -195,6 +197,7 @@ impl Builder {
             #[cfg(any(test, feature = "test-utils"))]
             path_selection: self.path_selection,
             metrics,
+            net_filter: self.net_filter,
         };
 
         let msock = magicsock::MagicSock::spawn(msock_opts).await?;
@@ -419,6 +422,20 @@ impl Builder {
     /// The default is 256, taking about 150 KiB in memory.
     pub fn max_tls_tickets(mut self, n: usize) -> Self {
         self.max_tls_tickets = n;
+        self
+    }
+
+    /// Ignore specific IP addresses during interface discovery.
+    pub fn ignore_address(mut self, addr: IpAddr) -> Self {
+        let filter = self.net_filter.get_or_insert_with(Default::default);
+        filter.ignore_addrs.insert(addr);
+        self
+    }
+
+    /// Only use specific IP addresses during interface discovery.
+    pub fn allow_address(mut self, addr: IpAddr) -> Self {
+        let filter = self.net_filter.get_or_insert_with(Default::default);
+        filter.allow_addrs.insert(addr);
         self
     }
 }
