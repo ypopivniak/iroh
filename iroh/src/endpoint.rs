@@ -425,17 +425,17 @@ impl Builder {
         self
     }
 
-    /// Ignore specific IP addresses during interface discovery.
-    pub fn ignore_address(mut self, addr: IpAddr) -> Self {
+    /// Exclude a specific IP address from interface discovery.
+    pub fn exclude_address(mut self, addr: IpAddr) -> Self {
         let filter = self.net_filter.get_or_insert_with(Default::default);
-        filter.ignore_addrs.insert(addr);
+        filter.excluded.insert(addr);
         self
     }
 
-    /// Only use specific IP addresses during interface discovery.
-    pub fn allow_address(mut self, addr: IpAddr) -> Self {
+    /// Restrict interface discovery to specific IP addresses only.
+    pub fn include_address(mut self, addr: IpAddr) -> Self {
         let filter = self.net_filter.get_or_insert_with(Default::default);
-        filter.allow_addrs.insert(addr);
+        filter.allowed.insert(addr);
         self
     }
 }

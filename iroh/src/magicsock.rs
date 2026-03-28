@@ -90,10 +90,10 @@ pub use self::{
 /// Filter for network interfaces and addresses.
 #[derive(Debug, Default, Clone)]
 pub struct NetFilter {
-    /// Addresses to explicitly ignore during discovery.
-    pub ignore_addrs: HashSet<IpAddr>,
+    /// Addresses to exclude from discovery.
+    pub excluded: HashSet<IpAddr>,
     /// If not empty, only these addresses will be considered.
-    pub allow_addrs: HashSet<IpAddr>,
+    pub allowed: HashSet<IpAddr>,
 }
 
 /// How long we consider a QAD-derived endpoint valid for. UDP NAT mappings typically
@@ -2217,12 +2217,12 @@ impl Actor {
 
             for ip in ips {
                 if let Some(ref filter) = self.msock.net_filter {
-                    if !filter.allow_addrs.is_empty() && !filter.allow_addrs.contains(&ip) {
-                        info!("skipping {ip:?} because it's not in allow_addrs");
+                    if !filter.allowed.is_empty() && !filter.allowed.contains(&ip) {
+                        debug!("skipping {ip:?}: not in allowed addrs");
                         continue;
                     }
-                    if filter.ignore_addrs.contains(&ip) {
-                        info!("skipping address {ip} due to netfilter");
+                    if filter.excluded.contains(&ip) {
+                        debug!("skipping {ip}: address excluded by filter");
                         continue;
                     }
                 }
@@ -3127,43 +3127,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_net_filter() {
-        let mut rng = rand::rng();
-        let secret_key = SecretKey::generate(&mut rng);
-        let mut server_config = make_default_server_config(&secret_key);
-        server_config.transport_config(Arc::new(quinn::TransportConfig::default()));
+    async fn test_net_filter_exclude() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
 
-        let dns_resolver = DnsResolver::new();
-        let mut net_filter = NetFilter::default();
-        // Ignore all IPv4 loopback (this is just an example, as loopback is only used if no other interfaces are found)
-        let ignored_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        net_filter.ignore_addrs.insert(ignored_ip);
+        // Discover baseline addresses without any filter.
+        let baseline = Handle::new(default_options(&mut rng)).await.unwrap();
+        let baseline_addrs = baseline.ip_addrs().get();
+        baseline.close().await;
 
-        let opts = Options {
-            addr_v4: None,
-            addr_v6: None,
-            secret_key: secret_key.clone(),
-            relay_map: RelayMap::empty(),
-            discovery_user_data: None,
-            dns_resolver,
-            proxy_url: None,
-            server_config,
-            #[cfg(any(test, feature = "test-utils"))]
-            insecure_skip_relay_cert_verify: false,
-            #[cfg(any(test, feature = "test-utils"))]
-            path_selection: PathSelection::default(),
-            metrics: Default::default(),
-            net_filter: Some(net_filter),
+        // Pick a non-loopback IP to exclude. If none exist (offline CI) skip the test.
+        let Some(target_ip) = baseline_addrs
+            .iter()
+            .map(|a| a.addr.ip())
+            .find(|ip| !ip.is_loopback())
+        else {
+            return;
         };
-        let msock = MagicSock::spawn(opts).await.unwrap();
 
-        // Wait a bit for discovery to run
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Build a filtered socket that excludes the target IP via the builder API.
+        let filtered = Handle::new({
+            let mut opts = default_options(&mut rng);
+            let mut filter = NetFilter::default();
+            filter.excluded.insert(target_ip);
+            opts.net_filter = Some(filter);
+            opts
+        })
+        .await
+        .unwrap();
 
-        let mut addrs = msock.ip_addrs();
-        let value = n0_watcher::Watcher::get(&mut addrs);
-        for addr in value.iter() {
-            assert_ne!(addr.addr.ip(), ignored_ip, "Ignored IP should not be discovered");
+        let filtered_addrs = filtered.ip_addrs().get();
+        filtered.close().await;
+
+        for addr in &filtered_addrs {
+            assert_ne!(
+                addr.addr.ip(),
+                target_ip,
+                "excluded IP {target_ip} should not appear in discovered addresses"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_net_filter_allow() {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1u64);
+
+        // Discover baseline addresses without any filter.
+        let baseline = Handle::new(default_options(&mut rng)).await.unwrap();
+        let baseline_addrs = baseline.ip_addrs().get();
+        baseline.close().await;
+
+        // Need at least two non-loopback IPs to make the allow filter observable.
+        let non_loopback: Vec<_> = baseline_addrs
+            .iter()
+            .map(|a| a.addr.ip())
+            .filter(|ip| !ip.is_loopback())
+            .collect();
+        if non_loopback.len() < 2 {
+            return;
+        }
+
+        // Allow only the first IP; all others should be absent.
+        let allowed_ip = non_loopback[0];
+        let filtered = Handle::new({
+            let mut opts = default_options(&mut rng);
+            let mut filter = NetFilter::default();
+            filter.allowed.insert(allowed_ip);
+            opts.net_filter = Some(filter);
+            opts
+        })
+        .await
+        .unwrap();
+
+        let filtered_addrs = filtered.ip_addrs().get();
+        filtered.close().await;
+
+        for addr in &filtered_addrs {
+            assert_eq!(
+                addr.addr.ip(),
+                allowed_ip,
+                "only the allowed IP {allowed_ip} should appear, found {}",
+                addr.addr.ip()
+            );
         }
     }
 
