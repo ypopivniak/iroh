@@ -473,8 +473,14 @@ impl MagicSock {
             .ok();
     }
 
-    #[cfg(test)]
-    async fn force_network_change(&self, is_major: bool) {
+    /// Unconditionally trigger the network-change handler.
+    ///
+    /// Bypasses [`netwatch`](https://crates.io/crates/netwatch)'s interface-state
+    /// comparison, which is unreachable inside sandboxed iOS NetworkExtension
+    /// processes (no `AF_ROUTE` socket). With `is_major = true` the magic
+    /// socket rebinds its UDP transports, re-runs netcheck, and resets endpoint
+    /// state — required to recover after a real path migration on iOS.
+    pub(crate) async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
             .send(ActorMessage::ForceNetworkChange(is_major))
             .await
@@ -1788,7 +1794,6 @@ enum ActorMessage {
     NetworkChange,
     ScheduleDirectAddrUpdate(UpdateReason, Option<(EndpointId, RelayUrl)>),
     RelayMapChange,
-    #[cfg(test)]
     ForceNetworkChange(bool),
 }
 
@@ -2085,7 +2090,6 @@ impl Actor {
             ActorMessage::RelayMapChange => {
                 self.handle_relay_map_change();
             }
-            #[cfg(test)]
             ActorMessage::ForceNetworkChange(is_major) => {
                 self.handle_network_change(is_major).await;
             }

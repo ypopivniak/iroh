@@ -1153,6 +1153,24 @@ impl Endpoint {
         self.msock.network_change().await;
     }
 
+    /// Unconditionally trigger the network-change handler.
+    ///
+    /// Unlike [`Self::network_change`], this bypasses
+    /// [`netwatch`](https://crates.io/crates/netwatch)'s interface-state
+    /// comparison, which is unreachable in environments that do not allow
+    /// reading the kernel route table (notably iOS NetworkExtension processes,
+    /// where `AF_ROUTE` sockets are blocked by the sandbox). With
+    /// `is_major = true`, the magic socket rebinds its UDP transports, re-runs
+    /// netcheck, and resets endpoint state — the path required to recover
+    /// after a real interface migration. With `is_major = false`, only
+    /// netcheck is re-run without rebinding.
+    ///
+    /// Callers that *can* rely on iroh's built-in detection should prefer
+    /// [`Self::network_change`].
+    pub async fn force_network_change(&self, is_major: bool) {
+        self.msock.force_network_change(is_major).await;
+    }
+
     // # Methods to update internal state.
 
     /// Sets the initial user-defined data to be published in discovery services for this endpoint.
