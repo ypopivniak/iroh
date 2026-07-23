@@ -15,7 +15,7 @@
 //! however, read any packets that come off the UDP sockets.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt::Display,
     io,
     net::{IpAddr, SocketAddr},
@@ -157,11 +157,23 @@ impl From<mpsc::error::SendError<RemoteStateMessage>> for RemoteStateActorStoppe
     }
 }
 
+/// Filter for network interfaces and addresses.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct NetFilter {
+    /// Addresses to exclude from discovery.
+    pub(crate) excluded: HashSet<IpAddr>,
+    /// If not empty, only these addresses will be considered.
+    pub(crate) allowed: HashSet<IpAddr>,
+}
+
 /// Contains options for `Socket::listen`.
 #[derive(derive_more::Debug)]
 pub(crate) struct Options {
     /// The configuration for the different transports.
     pub(crate) transports: Vec<TransportConfig>,
+
+    /// Optional network filter for local addresses.
+    pub(crate) net_filter: Option<NetFilter>,
 
     /// Secret key for this endpoint.
     pub(crate) secret_key: SecretKey,
@@ -355,6 +367,9 @@ pub(crate) struct Socket {
     ipv6_reported: Arc<AtomicBool>,
     /// Maps for resolving mapped addrs to/from IP and relay addresses.
     mapped_addrs: MappedAddrs,
+
+    /// Optional network filter for local addresses.
+    net_filter: Option<NetFilter>,
 
     /// Local addresses
     local_addrs_watch: LocalAddrsWatch,
@@ -879,6 +894,7 @@ impl EndpointInner {
 
         let Options {
             secret_key,
+            net_filter,
             transports: transport_configs,
             address_lookup_user_data,
             #[cfg(not(wasm_browser))]
@@ -991,6 +1007,7 @@ impl EndpointInner {
             remote_actors: remote_map.senders(),
             shutdown: shutdown_state,
             ipv6_reported,
+            net_filter,
             mapped_addrs: remote_map.mapped_addrs.clone(),
             address_lookup,
             relay_map: relay_map.clone(),
@@ -1293,8 +1310,14 @@ impl EndpointInner {
             .ok();
     }
 
-    #[cfg(all(test, with_crypto_provider))]
-    async fn force_network_change(&self, is_major: bool) {
+    /// Unconditionally trigger the network-change handler.
+    ///
+    /// Bypasses [`netwatch`](https://crates.io/crates/netwatch)'s interface-state
+    /// comparison, which is unreachable inside sandboxed iOS NetworkExtension
+    /// processes (no `AF_ROUTE` socket). With `is_major = true` the socket
+    /// rebinds its UDP transports, re-runs net_report, and resets endpoint
+    /// state — required to recover after a real path migration on iOS.
+    pub(crate) async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
             .send(ActorMessage::ForceNetworkChange(is_major))
             .await
@@ -1392,7 +1415,6 @@ enum ActorMessage {
     ),
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
     DirectAddrRefresh,
-    #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
 
@@ -1794,7 +1816,6 @@ impl Actor {
                     self.update_direct_addresses(report.as_ref());
                 }
             }
-            #[cfg(all(test, with_crypto_provider))]
             ActorMessage::ForceNetworkChange(is_major) => {
                 self.handle_network_change(is_major);
             }
@@ -1940,6 +1961,16 @@ impl Actor {
             }
 
             for ip in ips {
+                if let Some(ref filter) = self.sock.net_filter {
+                    if !filter.allowed.is_empty() && !filter.allowed.contains(&ip) {
+                        debug!("skipping {ip:?}: not in allowed addrs");
+                        continue;
+                    }
+                    if filter.excluded.contains(&ip) {
+                        debug!("skipping {ip}: address excluded by filter");
+                        continue;
+                    }
+                }
                 let port_if_unspecified = match ip {
                     IpAddr::V4(_) => has_ipv4_unspecified,
                     IpAddr::V6(_) => has_ipv6_unspecified,
@@ -2169,6 +2200,7 @@ mod tests {
                 TransportConfig::default_ipv6(),
             ],
             secret_key,
+            net_filter: None,
             proxy_url: None,
             dns_resolver: DnsResolver::new(),
             server_config,
@@ -2586,6 +2618,7 @@ mod tests {
                 TransportConfig::default_ipv6(),
             ],
             secret_key: secret_key.clone(),
+            net_filter: None,
             address_lookup_user_data: None,
             dns_resolver,
             proxy_url: None,

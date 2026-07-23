@@ -11,7 +11,12 @@
 //!
 //! [module docs]: crate
 
-use std::{collections::BTreeSet, net::SocketAddr, pin::Pin, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+};
 
 #[cfg(not(wasm_browser))]
 use ipnet::{Ipv4Net, Ipv6Net};
@@ -148,6 +153,7 @@ pub struct Builder {
     net_report_config: NetReportConfig,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     configured_addrs: BTreeSet<SocketAddr>,
+    net_filter: Option<socket::NetFilter>,
 }
 
 impl From<RelayMode> for Option<TransportConfig> {
@@ -216,6 +222,7 @@ impl Builder {
             net_report_config: Default::default(),
             crypto_provider: None,
             configured_addrs: Default::default(),
+            net_filter: None,
         }
     }
 
@@ -279,6 +286,7 @@ impl Builder {
             net_report_config: self.net_report_config,
             static_config,
             configured_addrs: self.configured_addrs,
+            net_filter: self.net_filter,
         };
 
         let inner = socket::EndpointInner::bind(sock_opts)
@@ -650,6 +658,27 @@ impl Builder {
     /// adding addresses at runtime.
     pub fn external_addr(mut self, addr: SocketAddr) -> Self {
         self.configured_addrs.insert(addr);
+        self
+    }
+
+    /// Exclude a specific IP address from interface discovery.
+    ///
+    /// Excluded addresses are dropped from the direct-address candidate set,
+    /// so they are never advertised to peers nor used for hole punching. Useful
+    /// to keep a local tunnel/TUN interface out of iroh's advertised paths.
+    pub fn exclude_address(mut self, addr: IpAddr) -> Self {
+        let filter = self.net_filter.get_or_insert_with(Default::default);
+        filter.excluded.insert(addr);
+        self
+    }
+
+    /// Restrict interface discovery to specific IP addresses only.
+    ///
+    /// If any address is added via this method, only those addresses are
+    /// considered during interface discovery; all others are dropped.
+    pub fn include_address(mut self, addr: IpAddr) -> Self {
+        let filter = self.net_filter.get_or_insert_with(Default::default);
+        filter.allowed.insert(addr);
         self
     }
 
@@ -1647,6 +1676,28 @@ impl Endpoint {
             return;
         }
         self.inner.network_change().await;
+    }
+
+    /// Unconditionally trigger the network-change handler.
+    ///
+    /// Unlike [`Self::network_change`], this bypasses
+    /// [`netwatch`](https://crates.io/crates/netwatch)'s interface-state
+    /// comparison, which is unreachable in environments that do not allow
+    /// reading the kernel route table (notably iOS NetworkExtension processes,
+    /// where `AF_ROUTE` sockets are blocked by the sandbox). With
+    /// `is_major = true`, the socket rebinds its UDP transports, re-runs
+    /// net_report, and resets endpoint state — the path required to recover
+    /// after a real interface migration. With `is_major = false`, only
+    /// net_report is re-run without rebinding.
+    ///
+    /// Callers that *can* rely on iroh's built-in detection should prefer
+    /// [`Self::network_change`].
+    pub async fn force_network_change(&self, is_major: bool) {
+        if self.is_closed() {
+            debug!("Attempting to force a network change on a closed endpoint. Ignoring.");
+            return;
+        }
+        self.inner.force_network_change(is_major).await;
     }
 
     // # Methods to update internal state.
